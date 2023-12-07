@@ -175,19 +175,45 @@ class Huggingface(BaseLLM):
                 or "generated_text" not in completion_response[0]): 
                 raise HuggingfaceError(status_code=422, message=f"response is not in expected format - {completion_response}")
 
+            ## TODO Determine if it's a function_call response
+            ## How do I get a list of functions provided to the model?
+
+            try:
+                print(completion_response[0]["generated_text"])
+                generated_text = output_parser(completion_response[0]["generated_text"])
+                # Remove code block lines
+                lines = generated_text.split('\n')
+                filtered_lines = [line for line in lines if not line.startswith("```")]
+                generated_text = '\n'.join(filtered_lines)
+
+                function_call_dict = json.loads(generated_text)
+                is_function_call_response = "function" in function_call_dict and "parameters" in function_call_dict
+            except json.JSONDecodeError:
+                is_function_call_response = False
+                print("INVALID JSON")
+
             if len(completion_response[0]["generated_text"]) > 0: 
                 model_response["choices"][0]["message"][
                     "content"
                 ] = output_parser(completion_response[0]["generated_text"])
             ## GETTING LOGPROBS + FINISH REASON 
             if "details" in completion_response[0] and "tokens" in completion_response[0]["details"]:
-                model_response.choices[0].finish_reason = completion_response[0]["details"]["finish_reason"]
+                print("____DETAILS____")
+                if is_function_call_response:
+                    model_response.choices[0].finish_reason = "function_call"
+                    from litellm.utils import FunctionCall
+                    function_call = FunctionCall(name=function_call_dict['function'], arguments=str(function_call_dict['parameters']))
+                    model_response.choices[0]["message"]["function_call"] = function_call
+                    model_response.choices[0]["message"]["content"] = None
+                else:
+                    model_response.choices[0].finish_reason = completion_response[0]["details"]["finish_reason"]
                 sum_logprob = 0
                 for token in completion_response[0]["details"]["tokens"]:
                     if token["logprob"] != None:
                         sum_logprob += token["logprob"]
                 model_response["choices"][0]["message"]._logprob = sum_logprob
             if "best_of" in optional_params and optional_params["best_of"] > 1: 
+                print("____BEST OF____")
                 if "details" in completion_response[0] and "best_of_sequences" in completion_response[0]["details"]:
                     choices_list = []
                     for idx, item in enumerate(completion_response[0]["details"]["best_of_sequences"]):

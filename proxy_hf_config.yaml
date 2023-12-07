@@ -1,0 +1,18 @@
+model_list:
+  - model_name: Llama-2-13b-chat-hf # the 1st model is the default on the proxy
+    litellm_params: # params for litellm.completion() - https://docs.litellm.ai/docs/completion/input#input---request-body
+      model: huggingface/meta-llama/Llama-2-13b-chat-hf
+      # api_base: http://host.docker.internal:8080
+      api_base: http://10.189.3.87:8080
+
+litellm_settings:
+  drop_params: True
+  set_verbose: True
+  add_function_to_prompt: True
+
+
+general_settings: 
+  # infer_model_from_keys: False
+
+# Start up proxy: litellm --config /workspaces/autogen-example/function_notebooks/litellm_config.yml
+# poetry run litellm --config proxy_hf_config.yaml

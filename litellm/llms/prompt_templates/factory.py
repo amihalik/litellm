@@ -280,18 +280,24 @@ def anthropic_pt(messages: list): # format - https://docs.anthropic.com/claude/r
 
 # Function call template 
 def function_call_prompt(messages: list, functions: list):
-    function_prompt = "The following functions are available to you:"
-    for function in functions: 
-        function_prompt += f"""\n{function}\n"""
+    # function_prompt = "The following functions are available to you:"
+    # for function in functions: 
+    #     function_prompt += f"""\n{function}\n"""
     
-    function_added_to_prompt = False
-    for message in messages: 
-        if "system" in message["role"]: 
-            message['content'] += f"""{function_prompt}"""
-            function_added_to_prompt = True
+    # function_added_to_prompt = False
+    # for message in messages: 
+    #     if "system" in message["role"]: 
+    #         message['content'] += f"""{function_prompt}"""
+    #         function_added_to_prompt = True
     
-    if function_added_to_prompt == False: 
-        messages.append({'role': 'system', 'content': f"""{function_prompt}"""})
+    # if function_added_to_prompt == False: 
+    #     messages.append({'role': 'system', 'content': f"""{function_prompt}"""})
+
+    prefix = """You're a helpful AI assistant. You have access to special functions that can gather more information or take actions on the user's behalf.  DO NOT use functions unless the user absolutely requires a function. When you call a function use the function_name and a JSON formatted specification."""
+
+    from .jd_utils import JdFunctionInjector
+    jd = JdFunctionInjector(prefix=prefix)
+    messages=jd(messages, functions)
 
     return messages
 
