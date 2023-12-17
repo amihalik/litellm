@@ -1,0 +1,46 @@
+version: "3.5"
+
+services:
+  litellm-dev:
+    build:
+      context: .
+      dockerfile: .devcontainer/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/litellm-dev  
+    command: sleep infinity
+    env_file:
+      .env
+
+  langfuse-server:
+    image: ghcr.io/langfuse/langfuse:latest
+    depends_on:
+      - db
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/postgres
+      - NEXTAUTH_SECRET=mysecret
+      - SALT=mysalt
+      - NEXTAUTH_URL=http:localhost:3000
+      - TELEMETRY_ENABLED=false
+      - NEXT_PUBLIC_SIGN_UP_DISABLED=false
+      - LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES=false
+
+  db:
+    image: postgres
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+    ports:
+      - 5432:5432
+    volumes:
+      - database_data:/var/lib/postgresql/data
+
+volumes:
+  database_data:
+    driver: local
