@@ -7,16 +7,18 @@
 #
 #  Thank you ! We ❤️ you! - Krrish & Ishaan 
 
+import copy
 from datetime import datetime
-from typing import Dict, List, Optional, Union, Literal
-import random, threading, time, traceback
+from typing import Dict, List, Optional, Union, Literal, Any
+import random, threading, time, traceback, uuid
 import litellm, openai
 from litellm.caching import RedisCache, InMemoryCache, DualCache
 import logging, asyncio
 import inspect, concurrent
 from openai import AsyncOpenAI
 from collections import defaultdict
-
+from litellm.router_strategy.least_busy import LeastBusyLoggingHandler
+import copy
 class Router:
     """
     Example usage:
@@ -53,10 +55,11 @@ class Router:
     ```
     """
     model_names: List = []
-    cache_responses: bool = False
+    cache_responses: Optional[bool] = False
     default_cache_time_seconds: int = 1 * 60 * 60  # 1 hour
     num_retries: int = 0
     tenacity = None
+    leastbusy_logger: Optional[LeastBusyLoggingHandler] = None
 
     def __init__(self,
                  model_list: Optional[list] = None,
@@ -65,8 +68,9 @@ class Router:
                  redis_host: Optional[str] = None,
                  redis_port: Optional[int] = None,
                  redis_password: Optional[str] = None,
-                 cache_responses: bool = False,
+                 cache_responses: Optional[bool] = False,
                  cache_kwargs: dict = {}, # additional kwargs to pass to RedisCache (see caching.py)
+                 caching_groups: Optional[List[tuple]] = None, # if you want to cache across model groups  
                  ## RELIABILITY ## 
                  num_retries: int = 0,
                  timeout: Optional[float] = None,
@@ -75,11 +79,13 @@ class Router:
                  fallbacks: List = [],
                  allowed_fails: Optional[int] = None,
                  context_window_fallbacks: List = [], 
+                 model_group_alias: Optional[dict] = {},
                  routing_strategy: Literal["simple-shuffle", "least-busy", "usage-based-routing", "latency-based-routing"] = "simple-shuffle") -> None:
 
         self.set_verbose = set_verbose 
         self.deployment_names: List = [] # names of models under litellm_params. ex. azure/chatgpt-v-2
         if model_list:
+            model_list = copy.deepcopy(model_list)
             self.set_model_list(model_list)
             self.healthy_deployments: List = self.model_list
             self.deployment_latency_map = {}
@@ -97,8 +103,9 @@ class Router:
         self.total_calls: defaultdict = defaultdict(int)            # dict to store total calls made to each model
         self.fail_calls: defaultdict = defaultdict(int)             # dict to store fail_calls made to each model
         self.success_calls: defaultdict = defaultdict(int)          # dict to store success_calls  made to each model
-
-
+        self.previous_models: List = [] # list to store failed calls (passed in as metadata to next call)
+        self.model_group_alias: dict = model_group_alias or {}      # dict to store aliases for router, ex. {"gpt-4": "gpt-3.5-turbo"}, all requests with gpt-4 -> get routed to gpt-3.5-turbo group
+        
         # make Router.chat.completions.create compatible for openai.chat.completions.create
         self.chat = litellm.Chat(params=default_litellm_params)
 
@@ -106,13 +113,10 @@ class Router:
         self.default_litellm_params = default_litellm_params
         self.default_litellm_params.setdefault("timeout", timeout)
         self.default_litellm_params.setdefault("max_retries", 0)
+        self.default_litellm_params.setdefault("metadata", {}).update({"caching_groups": caching_groups})
 
-
-        ### HEALTH CHECK THREAD ###
-        if self.routing_strategy == "least-busy":
-            self._start_health_check_thread()
         ### CACHING ###
-        cache_type = "local" # default to an in-memory cache
+        cache_type: Literal["local", "redis"] = "local" # default to an in-memory cache
         redis_cache = None
         cache_config = {} 
         if redis_url is not None or (redis_host is not None and redis_port is not None and redis_password is not None):
@@ -134,9 +138,21 @@ class Router:
             cache_config.update(cache_kwargs)
             redis_cache = RedisCache(**cache_config)
         if cache_responses:
-            litellm.cache = litellm.Cache(type=cache_type, **cache_config)
+            if litellm.cache is None:
+                # the cache can be initialized on the proxy server. We should not overwrite it
+                litellm.cache = litellm.Cache(type=cache_type, **cache_config) # type: ignore
             self.cache_responses = cache_responses
         self.cache = DualCache(redis_cache=redis_cache, in_memory_cache=InMemoryCache()) # use a dual cache (Redis+In-Memory) for tracking cooldowns, usage, etc.
+        ### ROUTING SETUP ### 
+        if routing_strategy == "least-busy":
+            self.leastbusy_logger = LeastBusyLoggingHandler(router_cache=self.cache) 
+            ## add callback
+            if isinstance(litellm.input_callback, list): 
+                litellm.input_callback.append(self.leastbusy_logger) # type: ignore
+            else: 
+                litellm.input_callback = [self.leastbusy_logger] # type: ignore
+            if isinstance(litellm.callbacks, list):
+                litellm.callbacks.append(self.leastbusy_logger) # type: ignore
         ## USAGE TRACKING ## 
         if isinstance(litellm.success_callback, list):
             litellm.success_callback.append(self.deployment_callback)
@@ -184,23 +200,15 @@ class Router:
         
         try: 
             # pick the one that is available (lowest TPM/RPM)
-            deployment = self.get_available_deployment(model=model, messages=messages)
+            deployment = self.get_available_deployment(model=model, messages=messages, specific_deployment=kwargs.pop("specific_deployment", None))
             kwargs.setdefault("metadata", {}).update({"deployment": deployment["litellm_params"]["model"]})
             data = deployment["litellm_params"].copy()
+            kwargs["model_info"] = deployment.get("model_info", {})
             for k, v in self.default_litellm_params.items(): 
-                if k not in data: # prioritize model-specific params > default router params 
-                    data[k] = v
-            
-            ########## remove -ModelID-XXXX from model ##############
-            original_model_string = data["model"]
-            # Find the index of "ModelID" in the string
-            self.print_verbose(f"completion model: {original_model_string}")
-            index_of_model_id = original_model_string.find("-ModelID")
-            # Remove everything after "-ModelID" if it exists
-            if index_of_model_id != -1:
-                data["model"] = original_model_string[:index_of_model_id]
-            else:
-                data["model"] = original_model_string
+                if k not in kwargs: # prioritize model-specific params > default router params 
+                    kwargs[k] = v
+                elif k == "metadata":
+                    kwargs[k].update(v)
             model_client = self._get_client(deployment=deployment, kwargs=kwargs)
             return litellm.completion(**{**data, "messages": messages, "caching": self.cache_responses, "client": model_client, **kwargs})
         except Exception as e: 
@@ -231,30 +239,25 @@ class Router:
             **kwargs):
         try: 
             self.print_verbose(f"Inside _acompletion()- model: {model}; kwargs: {kwargs}")
-            original_model_string = None # set a default for this variable
-            deployment = self.get_available_deployment(model=model, messages=messages)
+            deployment = self.get_available_deployment(model=model, messages=messages, specific_deployment=kwargs.pop("specific_deployment", None))
             kwargs.setdefault("metadata", {}).update({"deployment": deployment["litellm_params"]["model"]})
+            kwargs["model_info"] = deployment.get("model_info", {})
             data = deployment["litellm_params"].copy()
+            model_name = data["model"]
             for k, v in self.default_litellm_params.items(): 
-                if k not in data: # prioritize model-specific params > default router params 
-                    data[k] = v
-            ########## remove -ModelID-XXXX from model ##############
-            original_model_string = data["model"]
-            # Find the index of "ModelID" in the string
-            index_of_model_id = original_model_string.find("-ModelID")
-            # Remove everything after "-ModelID" if it exists
-            if index_of_model_id != -1:
-                data["model"] = original_model_string[:index_of_model_id]
-            else:
-                data["model"] = original_model_string
+                if k not in kwargs: # prioritize model-specific params > default router params 
+                    kwargs[k] = v
+                elif k == "metadata":
+                    kwargs[k].update(v)
+
             model_client = self._get_client(deployment=deployment, kwargs=kwargs, client_type="async")
-            self.total_calls[original_model_string] +=1
+            self.total_calls[model_name] +=1
             response = await litellm.acompletion(**{**data, "messages": messages, "caching": self.cache_responses, "client": model_client, **kwargs})
-            self.success_calls[original_model_string] +=1
+            self.success_calls[model_name] +=1
             return response
         except Exception as e: 
-            if original_model_string is not None:
-                self.fail_calls[original_model_string] +=1
+            if model_name is not None:
+                self.fail_calls[model_name] +=1
             raise e
        
     def text_completion(self,
@@ -268,12 +271,47 @@ class Router:
             kwargs.setdefault("metadata", {}).update({"model_group": model})
             messages=[{"role": "user", "content": prompt}]
             # pick the one that is available (lowest TPM/RPM)
-            deployment = self.get_available_deployment(model=model, messages=messages)
+            deployment = self.get_available_deployment(model=model, messages=messages, specific_deployment=kwargs.pop("specific_deployment", None))
 
             data = deployment["litellm_params"].copy()
             for k, v in self.default_litellm_params.items(): 
-                if k not in data: # prioritize model-specific params > default router params 
-                    data[k] = v
+                if k not in kwargs: # prioritize model-specific params > default router params 
+                    kwargs[k] = v
+                elif k == "metadata":
+                    kwargs[k].update(v)
+
+            # call via litellm.completion()
+            return litellm.text_completion(**{**data, "prompt": prompt, "caching": self.cache_responses, **kwargs}) # type: ignore
+        except Exception as e: 
+            if self.num_retries > 0:
+                kwargs["model"] = model
+                kwargs["messages"] = messages
+                kwargs["original_exception"] = e
+                kwargs["original_function"] = self.completion
+                return self.function_with_retries(**kwargs)
+            else: 
+                raise e
+    
+    async def atext_completion(self,
+                        model: str,
+                        prompt: str,
+                        is_retry: Optional[bool] = False,
+                        is_fallback: Optional[bool] = False,
+                        is_async: Optional[bool] = False,
+                        **kwargs):
+        try: 
+            kwargs.setdefault("metadata", {}).update({"model_group": model})
+            messages=[{"role": "user", "content": prompt}]
+            # pick the one that is available (lowest TPM/RPM)
+            deployment = self.get_available_deployment(model=model, messages=messages, specific_deployment=kwargs.pop("specific_deployment", None))
+
+            data = deployment["litellm_params"].copy()
+            for k, v in self.default_litellm_params.items(): 
+                if k not in kwargs: # prioritize model-specific params > default router params 
+                    kwargs[k] = v
+                elif k == "metadata":
+                    kwargs[k].update(v)
+
             ########## remove -ModelID-XXXX from model ##############
             original_model_string = data["model"]
             # Find the index of "ModelID" in the string
@@ -283,8 +321,9 @@ class Router:
                 data["model"] = original_model_string[:index_of_model_id]
             else:
                 data["model"] = original_model_string
-            # call via litellm.completion()
-            return litellm.text_completion(**{**data, "prompt": prompt, "caching": self.cache_responses, **kwargs}) # type: ignore
+            # call via litellm.atext_completion()
+            response = await litellm.atext_completion(**{**data, "prompt": prompt, "caching": self.cache_responses, **kwargs}) # type: ignore
+            return response
         except Exception as e: 
             if self.num_retries > 0:
                 kwargs["model"] = model
@@ -301,21 +340,15 @@ class Router:
                   is_async: Optional[bool] = False,
                   **kwargs) -> Union[List[float], None]:
         # pick the one that is available (lowest TPM/RPM)
-        deployment = self.get_available_deployment(model=model, input=input)
-        kwargs.setdefault("metadata", {}).update({"deployment": deployment["litellm_params"]["model"]})
+        deployment = self.get_available_deployment(model=model, input=input, specific_deployment=kwargs.pop("specific_deployment", None))
+        kwargs.setdefault("model_info", {})
+        kwargs.setdefault("metadata", {}).update({"model_group": model, "deployment": deployment["litellm_params"]["model"]}) # [TODO]: move to using async_function_with_fallbacks
         data = deployment["litellm_params"].copy()
         for k, v in self.default_litellm_params.items(): 
-            if k not in data: # prioritize model-specific params > default router params 
-                data[k] = v
-        ########## remove -ModelID-XXXX from model ##############
-        original_model_string = data["model"]
-        # Find the index of "ModelID" in the string
-        index_of_model_id = original_model_string.find("-ModelID")
-        # Remove everything after "-ModelID" if it exists
-        if index_of_model_id != -1:
-            data["model"] = original_model_string[:index_of_model_id]
-        else:
-            data["model"] = original_model_string
+                if k not in kwargs: # prioritize model-specific params > default router params 
+                    kwargs[k] = v
+                elif k == "metadata":
+                    kwargs[k].update(v)
         model_client = self._get_client(deployment=deployment, kwargs=kwargs)
         # call via litellm.embedding()
         return litellm.embedding(**{**data, "input": input, "caching": self.cache_responses, "client": model_client, **kwargs})
@@ -326,21 +359,16 @@ class Router:
                          is_async: Optional[bool] = True,
                          **kwargs) -> Union[List[float], None]:
         # pick the one that is available (lowest TPM/RPM)
-        deployment = self.get_available_deployment(model=model, input=input)
-        kwargs.setdefault("metadata", {}).update({"deployment": deployment["litellm_params"]["model"]})
+        deployment = self.get_available_deployment(model=model, input=input, specific_deployment=kwargs.pop("specific_deployment", None))
+        kwargs.setdefault("metadata", {}).update({"model_group": model, "deployment": deployment["litellm_params"]["model"]})
         data = deployment["litellm_params"].copy()
+        kwargs["model_info"] = deployment.get("model_info", {})
         for k, v in self.default_litellm_params.items(): 
-            if k not in data: # prioritize model-specific params > default router params 
-                data[k] = v
-        ########## remove -ModelID-XXXX from model ##############
-        original_model_string = data["model"]
-        # Find the index of "ModelID" in the string
-        index_of_model_id = original_model_string.find("-ModelID")
-        # Remove everything after "-ModelID" if it exists
-        if index_of_model_id != -1:
-            data["model"] = original_model_string[:index_of_model_id]
-        else:
-            data["model"] = original_model_string
+                if k not in kwargs: # prioritize model-specific params > default router params 
+                    kwargs[k] = v
+                elif k == "metadata":
+                    kwargs[k].update(v)
+
         model_client = self._get_client(deployment=deployment, kwargs=kwargs, client_type="async")
         
         return await litellm.aembedding(**{**data, "input": input, "caching": self.cache_responses, "client": model_client, **kwargs})
@@ -358,7 +386,7 @@ class Router:
             self.print_verbose(f'Async Response: {response}')
             return response
         except Exception as e: 
-            self.print_verbose(f"An exception occurs")
+            self.print_verbose(f"An exception occurs: {e}\n\n Traceback{traceback.format_exc()}")
             original_exception = e
             try: 
                 self.print_verbose(f"Trying to fallback b/w models")
@@ -393,6 +421,8 @@ class Router:
                         Iterate through the model groups and try calling that deployment
                         """
                         try:
+                            ## LOGGING
+                            kwargs = self.log_retry(kwargs=kwargs, e=original_exception)
                             kwargs["model"] = mg
                             kwargs["metadata"]["model_group"] = mg
                             response = await self.async_function_with_retries(*args, **kwargs)
@@ -436,6 +466,10 @@ class Router:
             else: 
                 raise original_exception
             
+            ## LOGGING
+            if num_retries > 0:
+                kwargs = self.log_retry(kwargs=kwargs, e=original_exception)
+            
             for current_attempt in range(num_retries):
                 self.print_verbose(f"retrying request. Current attempt - {current_attempt}; num retries: {num_retries}")
                 try:
@@ -446,6 +480,8 @@ class Router:
                     return response
                 
                 except Exception as e: 
+                    ## LOGGING
+                    kwargs = self.log_retry(kwargs=kwargs, e=e)
                     remaining_retries = num_retries - current_attempt
                     if "No models available" in str(e): 
                         timeout = litellm._calculate_retry_after(remaining_retries=remaining_retries, max_retries=num_retries, min_timeout=1)
@@ -471,13 +507,12 @@ class Router:
         try: 
             response = self.function_with_retries(*args, **kwargs)
             return response
-        except Exception as e: 
+        except Exception as e:
             original_exception = e
             self.print_verbose(f"An exception occurs {original_exception}")
             try: 
                 self.print_verbose(f"Trying to fallback b/w models. Initial model group: {model_group}")
                 if isinstance(e, litellm.ContextWindowExceededError) and context_window_fallbacks is not None: 
-                    self.print_verbose(f"inside context window fallbacks: {context_window_fallbacks}")
                     fallback_model_group = None
 
                     for item in context_window_fallbacks: # [{"gpt-3.5-turbo": ["gpt-4"]}]
@@ -493,6 +528,8 @@ class Router:
                         Iterate through the model groups and try calling that deployment
                         """
                         try:
+                            ## LOGGING
+                            kwargs = self.log_retry(kwargs=kwargs, e=original_exception)
                             kwargs["model"] = mg
                             response = self.function_with_fallbacks(*args, **kwargs)
                             return response 
@@ -514,11 +551,13 @@ class Router:
                         Iterate through the model groups and try calling that deployment
                         """
                         try:
+                            ## LOGGING
+                            kwargs = self.log_retry(kwargs=kwargs, e=original_exception)
                             kwargs["model"] = mg
                             response = self.function_with_fallbacks(*args, **kwargs)
                             return response 
                         except Exception as e: 
-                            pass
+                            raise e
             except Exception as e: 
                 raise e
             raise original_exception
@@ -528,7 +567,6 @@ class Router:
         Try calling the model 3 times. Shuffle between available deployments. 
         """
         self.print_verbose(f"Inside function with retries: args - {args}; kwargs - {kwargs}")
-        backoff_factor = 1
         original_function = kwargs.pop("original_function")
         num_retries = kwargs.pop("num_retries")
         fallbacks = kwargs.pop("fallbacks", self.fallbacks)
@@ -544,6 +582,9 @@ class Router:
             if ((isinstance(original_exception, litellm.ContextWindowExceededError) and context_window_fallbacks is None) 
                 or (isinstance(original_exception, openai.RateLimitError) and fallbacks is not None)): 
                 raise original_exception
+            ## LOGGING
+            if num_retries > 0:
+                kwargs = self.log_retry(kwargs=kwargs, e=original_exception)
             ### RETRY
             for current_attempt in range(num_retries):
                 self.print_verbose(f"retrying request. Current attempt - {current_attempt}; retries left: {num_retries}")
@@ -552,19 +593,19 @@ class Router:
                     response = original_function(*args, **kwargs)
                     return response
 
-                except openai.RateLimitError as e:
-                    if num_retries > 0: 
-                        remaining_retries = num_retries - current_attempt
-                        timeout = litellm._calculate_retry_after(remaining_retries=remaining_retries, max_retries=num_retries)
-                        # on RateLimitError we'll wait for an exponential time before trying again
+                except Exception as e: 
+                    ## LOGGING
+                    kwargs = self.log_retry(kwargs=kwargs, e=e)
+                    remaining_retries = num_retries - current_attempt
+                    if "No models available" in str(e): 
+                        timeout = litellm._calculate_retry_after(remaining_retries=remaining_retries, max_retries=num_retries, min_timeout=1)
                         time.sleep(timeout)
-                    else: 
-                        raise e
-                    
-                except Exception as e:
-                    # for any other exception types, immediately retry
-                    if num_retries > 0: 
-                        pass
+                    elif hasattr(e, "status_code") and hasattr(e, "response") and litellm._should_retry(status_code=e.status_code):
+                        if hasattr(e.response, "headers"):
+                            timeout = litellm._calculate_retry_after(remaining_retries=remaining_retries, max_retries=num_retries, response_headers=e.response.headers)
+                        else:
+                            timeout = litellm._calculate_retry_after(remaining_retries=remaining_retries, max_retries=num_retries)
+                        time.sleep(timeout)
                     else: 
                         raise e
             raise original_exception
@@ -611,9 +652,10 @@ class Router:
             model_name = kwargs.get('model', None)  # i.e. gpt35turbo
             custom_llm_provider = kwargs.get("litellm_params", {}).get('custom_llm_provider', None)  # i.e. azure
             metadata = kwargs.get("litellm_params", {}).get('metadata', None)
+            deployment_id =  kwargs.get("litellm_params", {}).get("model_info").get("id")
+            self._set_cooldown_deployments(deployment_id)  # setting deployment_id in cooldown deployments
             if metadata: 
                 deployment = metadata.get("deployment", None)
-                self._set_cooldown_deployments(deployment)
                 deployment_exceptions = self.model_exception_map.get(deployment, [])
                 deployment_exceptions.append(exception_str)
                 self.model_exception_map[deployment] = deployment_exceptions
@@ -625,6 +667,27 @@ class Router:
                 model_name = f"{custom_llm_provider}/{model_name}"
             
         except Exception as e:
+            raise e
+
+    def log_retry(self, kwargs: dict, e: Exception) -> dict: 
+        """
+        When a retry or fallback happens, log the details of the just failed model call - similar to Sentry breadcrumbing
+        """
+        try: 
+            # Log failed model as the previous model
+            previous_model = {"exception_type": type(e).__name__, "exception_string": str(e)} 
+            for k, v in kwargs.items(): # log everything in kwargs except the old previous_models value - prevent nesting 
+                if k != "metadata":
+                    previous_model[k] = v
+                elif k == "metadata" and isinstance(v, dict): 
+                    previous_model["metadata"] = {} # type: ignore
+                    for metadata_k, metadata_v in kwargs['metadata'].items(): 
+                        if metadata_k != "previous_models": 
+                            previous_model[k][metadata_k] = metadata_v # type: ignore
+            self.previous_models.append(previous_model)
+            kwargs["metadata"]["previous_models"] = self.previous_models
+            return kwargs
+        except Exception as e: 
             raise e
 
     def _set_cooldown_deployments(self, 
@@ -830,66 +893,78 @@ class Router:
         return chosen_item
 
     def set_model_list(self, model_list: list):
-        self.model_list = model_list
+        self.model_list = copy.deepcopy(model_list)
         # we add api_base/api_key each model so load balancing between azure/gpt on api_base1 and api_base2 works 
         import os
         for model in self.model_list:
             litellm_params = model.get("litellm_params", {})
             model_name = litellm_params.get("model")
+            #### MODEL ID INIT ########
+            model_info = model.get("model_info", {})
+            model_info["id"] = model_info.get("id", str(uuid.uuid4()))
+            model["model_info"] = model_info
             ####  for OpenAI / Azure we need to initalize the Client for High Traffic ########
             custom_llm_provider = litellm_params.get("custom_llm_provider")
-            if custom_llm_provider is None:
-                custom_llm_provider = model_name.split("/",1)[0]
+            custom_llm_provider = custom_llm_provider or model_name.split("/",1)[0] or ""
+            default_api_base = None
+            default_api_key = None
+            if custom_llm_provider in litellm.openai_compatible_providers:
+                _, custom_llm_provider, api_key, api_base = litellm.get_llm_provider(model=model_name)
+                default_api_base = api_base
+                default_api_key = api_key
             if (
                 model_name in litellm.open_ai_chat_completion_models
-                or custom_llm_provider == "custom_openai"
-                or custom_llm_provider == "deepinfra"
-                or custom_llm_provider == "perplexity"
-                or custom_llm_provider == "anyscale"
-                or custom_llm_provider == "openai"
+                or custom_llm_provider in litellm.openai_compatible_providers
                 or custom_llm_provider == "azure"
+                or custom_llm_provider == "custom_openai"
+                or custom_llm_provider == "openai"
                 or "ft:gpt-3.5-turbo" in model_name
                 or model_name in litellm.open_ai_embedding_models
             ):
                 # glorified / complicated reading of configs
                 # user can pass vars directly or they can pas os.environ/AZURE_API_KEY, in which case we will read the env
                 # we do this here because we init clients for Azure, OpenAI and we need to set the right key 
-                api_key = litellm_params.get("api_key")
+                api_key = litellm_params.get("api_key") or default_api_key
                 if api_key and api_key.startswith("os.environ/"):
                     api_key_env_name = api_key.replace("os.environ/", "")
                     api_key = litellm.get_secret(api_key_env_name)
+                    litellm_params["api_key"] = api_key
 
                 api_base = litellm_params.get("api_base")
                 base_url = litellm_params.get("base_url")
-                api_base = api_base or base_url # allow users to pass in `api_base` or `base_url` for azure
+                api_base = api_base or base_url or default_api_base # allow users to pass in `api_base` or `base_url` for azure
                 if api_base and api_base.startswith("os.environ/"):
                     api_base_env_name = api_base.replace("os.environ/", "")
                     api_base = litellm.get_secret(api_base_env_name)
+                    litellm_params["api_base"] = api_base
 
                 api_version = litellm_params.get("api_version")
                 if api_version and api_version.startswith("os.environ/"):
                     api_version_env_name = api_version.replace("os.environ/", "")
                     api_version = litellm.get_secret(api_version_env_name)
+                    litellm_params["api_version"] = api_version
 
                 timeout = litellm_params.pop("timeout", None)
                 if isinstance(timeout, str) and timeout.startswith("os.environ/"):
-                    timeout_env_name = api_version.replace("os.environ/", "")
+                    timeout_env_name = timeout.replace("os.environ/", "")
                     timeout = litellm.get_secret(timeout_env_name)
+                    litellm_params["timeout"] = timeout
 
                 stream_timeout = litellm_params.pop("stream_timeout", timeout) # if no stream_timeout is set, default to timeout
                 if isinstance(stream_timeout, str) and stream_timeout.startswith("os.environ/"):
-                    stream_timeout_env_name = api_version.replace("os.environ/", "")
+                    stream_timeout_env_name = stream_timeout.replace("os.environ/", "")
                     stream_timeout = litellm.get_secret(stream_timeout_env_name)
+                    litellm_params["stream_timeout"] = stream_timeout
 
                 max_retries = litellm_params.pop("max_retries", 2)
                 if isinstance(max_retries, str) and max_retries.startswith("os.environ/"):
-                    max_retries_env_name = api_version.replace("os.environ/", "")
+                    max_retries_env_name = max_retries.replace("os.environ/", "")
                     max_retries = litellm.get_secret(max_retries_env_name)
+                    litellm_params["max_retries"] = max_retries
                 
                 if "azure" in model_name:
                     if api_base is None:
-                        raise ValueError("api_base is required for Azure OpenAI. Set it on your config")
-                    self.print_verbose(f"Initializing Azure OpenAI Client for {model_name}, Api Base: {str(api_base)}, Api Key:{api_key}")
+                        raise ValueError(f"api_base is required for Azure OpenAI. Set it on your config. Model - {model}")
                     if api_version is None:
                         api_version = "2023-07-01-preview"
                     if "gateway.ai.cloudflare.com" in api_base: 
@@ -928,6 +1003,7 @@ class Router:
                             max_retries=max_retries
                         )
                     else:
+                        self.print_verbose(f"Initializing Azure OpenAI Client for {model_name}, Api Base: {str(api_base)}, Api Key:{api_key}")
                         model["async_client"] = openai.AsyncAzureOpenAI(
                             api_key=api_key,
                             azure_endpoint=api_base,
@@ -992,11 +1068,7 @@ class Router:
 
             ############ End of initializing Clients for OpenAI/Azure ###################
             self.deployment_names.append(model["litellm_params"]["model"])
-            model_id = ""
-            for key in model["litellm_params"]:
-                if key != "api_key":
-                    model_id+= str(model["litellm_params"][key])
-            model["litellm_params"]["model"] += "-ModelID-" + model_id
+            self.print_verbose(f"\n Initialized Model List {self.model_list}")
 
             ############ Users can either pass tpm/rpm as a litellm_param or a router param ###########
             # for get_available_deployment, we use the litellm_param["rpm"]
@@ -1035,56 +1107,87 @@ class Router:
                 return deployment.get("client", None)
 
     def print_verbose(self, print_statement): 
-        if self.set_verbose or litellm.set_verbose: 
-            print(f"LiteLLM.Router: {print_statement}") # noqa
+        try:
+            if self.set_verbose or litellm.set_verbose: 
+                print(f"LiteLLM.Router: {print_statement}") # noqa
+        except:
+            pass
 
     def get_available_deployment(self,
                                model: str,
                                messages: Optional[List[Dict[str, str]]] = None,
-                               input: Optional[Union[str, List]] = None):
+                               input: Optional[Union[str, List]] = None,
+                               specific_deployment: Optional[bool] = False
+                            ):
         """
         Returns the deployment based on routing strategy
         """
+
+        # users need to explicitly call a specific deployment, by setting `specific_deployment = True` as completion()/embedding() kwarg
+        # When this was no explicit we had several issues with fallbacks timing out
+        if specific_deployment == True:
+            # users can also specify a specific deployment name. At this point we should check if they are just trying to call a specific deployment
+            for deployment in self.model_list: 
+                deployment_model = deployment.get("litellm_params").get("model")
+                if deployment_model == model: 
+                    # User Passed a specific deployment name on their config.yaml, example azure/chat-gpt-v-2
+                    # return the first deployment where the `model` matches the specificed deployment name
+                    return deployment
+            raise ValueError(f"LiteLLM Router: Trying to call specific deployment, but Model:{model} does not exist in Model List: {self.model_list}")
+
+        # check if aliases set on litellm model alias map
+        if model in self.model_group_alias:
+            self.print_verbose(f"Using a model alias. Got Request for {model}, sending requests to {self.model_group_alias.get(model)}")
+            model = self.model_group_alias[model]
+
         ## get healthy deployments
         ### get all deployments 
-        ### filter out the deployments currently cooling down 
         healthy_deployments = [m for m in self.model_list if m["model_name"] == model]
         if len(healthy_deployments) == 0: 
             # check if the user sent in a deployment name instead 
             healthy_deployments = [m for m in self.model_list if m["litellm_params"]["model"] == model]
+
         self.print_verbose(f"initial list of deployments: {healthy_deployments}")
+
+        # filter out the deployments currently cooling down 
         deployments_to_remove = [] 
-        cooldown_deployments = self._get_cooldown_deployments()
+        # cooldown_deployments is a list of model_id's cooling down, cooldown_deployments = ["16700539-b3cd-42f4-b426-6a12a1bb706a", "16700539-b3cd-42f4-b426-7899"]
+        cooldown_deployments = self._get_cooldown_deployments() 
         self.print_verbose(f"cooldown deployments: {cooldown_deployments}")
-        ### FIND UNHEALTHY DEPLOYMENTS
+        # Find deployments in model_list whose model_id is cooling down
         for deployment in healthy_deployments: 
-            deployment_name = deployment["litellm_params"]["model"]
-            if deployment_name in cooldown_deployments: 
+            deployment_id = deployment["model_info"]["id"]
+            if deployment_id in cooldown_deployments: 
                 deployments_to_remove.append(deployment)
-        ### FILTER OUT UNHEALTHY DEPLOYMENTS
+        # remove unhealthy deployments from healthy deployments
         for deployment in deployments_to_remove:
             healthy_deployments.remove(deployment)
+
         self.print_verbose(f"healthy deployments: length {len(healthy_deployments)} {healthy_deployments}")
         if len(healthy_deployments) == 0: 
-            # users can also specify a specific deployment name. At this point we should check if they are just trying to call a specific deployment
-            for deployment in self.model_list: 
-                cleaned_model = litellm.utils.remove_model_id(deployment.get("litellm_params").get("model"))
-                if cleaned_model == model: 
-                    # User Passed a specific deployment name on their config.yaml, example azure/chat-gpt-v-2
-                    # return the first deployment where the `model` matches the specificed deployment name
-                    return deployment
             raise ValueError("No models available")
         if litellm.model_alias_map and model in litellm.model_alias_map:
             model = litellm.model_alias_map[
                 model
             ]  # update the model to the actual value if an alias has been passed in
-        if self.routing_strategy == "least-busy":
-            if len(self.healthy_deployments) > 0:
-                for item in self.healthy_deployments:
-                    if item[0]["model_name"] == model: # first one in queue will be the one with the most availability
-                        return item[0]
+        if self.routing_strategy == "least-busy" and self.leastbusy_logger is not None:
+            deployments = self.leastbusy_logger.get_available_deployments(model_group=model)
+            # pick least busy deployment
+            min_traffic = float('inf')
+            min_deployment = None
+            for k, v in deployments.items(): 
+                if v < min_traffic:
+                    min_deployment = k
+            ############## No Available Deployments passed, we do a random pick #################
+            if min_deployment is None: 
+                min_deployment = random.choice(healthy_deployments)
+            ############## Available Deployments passed, we find the relevant item #################
             else: 
-                raise ValueError("No models available.")
+                for m in healthy_deployments: 
+                    if m["model_info"]["id"] == min_deployment:
+                        return m
+                min_deployment = random.choice(healthy_deployments)
+            return min_deployment 
         elif self.routing_strategy == "simple-shuffle": 
             # if users pass rpm or tpm, we do a random weighted pick - based on rpm/tpm
             ############## Check if we can do a RPM/TPM based weighted pick #################
@@ -1135,11 +1238,14 @@ class Router:
         raise ValueError("No models available.")
 
     def flush_cache(self):
+        litellm.cache = None
         self.cache.flush_cache()
     
     def reset(self): 
         ## clean up on close
         litellm.success_callback = [] 
+        litellm.__async_success_callback = [] 
         litellm.failure_callback = [] 
+        litellm._async_failure_callback = [] 
         self.flush_cache() 
         

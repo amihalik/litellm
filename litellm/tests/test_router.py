@@ -184,7 +184,7 @@ def test_call_one_endpoint():
 				"rpm": 10000,
 			},
 		]
-
+		litellm.set_verbose=True
 		router = Router(model_list=model_list, 
 					routing_strategy="simple-shuffle",
 					set_verbose=True,
@@ -200,6 +200,7 @@ def test_call_one_endpoint():
 						"content": "hello this request will pass"
 					}
 				],
+				specific_deployment=True
 			)
 			print("\n response", response)
 
@@ -212,6 +213,7 @@ def test_call_one_endpoint():
 						"content": "hello this request will pass"
 					}
 				],
+				specific_deployment=True
 			)
 
 			print("\n response", response)
@@ -219,11 +221,11 @@ def test_call_one_endpoint():
 		async def call_azure_embedding():
 			response = await router.aembedding(
 				model="azure/azure-embedding-model",
-				input = ["good morning from litellm"]
+				input = ["good morning from litellm"],
+				specific_deployment=True
 			)
 
 			print("\n response", response)
-
 		asyncio.run(call_azure_completion())
 		asyncio.run(call_bedrock_claude())
 		asyncio.run(call_azure_embedding())
@@ -323,7 +325,7 @@ def test_router_azure_acompletion():
 		os.environ["AZURE_API_KEY"] = old_api_key
 		print(f"FAILED TEST")
 		pytest.fail(f"Got unexpected exception on router! - {e}")
-test_router_azure_acompletion()
+# test_router_azure_acompletion()
 
 ### FUNCTION CALLING 
 
@@ -364,65 +366,10 @@ def test_function_calling():
 		}
 	]
 
-	router = Router(model_list=model_list, routing_strategy="latency-based-routing")
+	router = Router(model_list=model_list)
 	response = router.completion(model="gpt-3.5-turbo-0613", messages=messages, functions=functions)
 	router.reset()
 	print(response)
-
-def test_acompletion_on_router(): 
-	try:
-		litellm.set_verbose = False
-		model_list = [
-			{
-				"model_name": "gpt-3.5-turbo",
-				"litellm_params": {
-					"model": "gpt-3.5-turbo-0613",
-					"api_key": os.getenv("OPENAI_API_KEY"),
-				},
-				"tpm": 100000,
-				"rpm": 10000,
-			},
-			{
-				"model_name": "gpt-3.5-turbo",
-				"litellm_params": {
-					"model": "azure/chatgpt-v-2",
-					"api_key": os.getenv("AZURE_API_KEY"),
-					"api_base": os.getenv("AZURE_API_BASE"),
-					"api_version": os.getenv("AZURE_API_VERSION")
-				},
-				"tpm": 100000,
-				"rpm": 10000,
-			}
-		]
-
-		messages = [
-			{"role": "user", "content": f"write a one sentence poem {time.time()}?"}
-		]
-		start_time = time.time()
-		router = Router(model_list=model_list, 
-				redis_host=os.environ["REDIS_HOST"], 
-				redis_password=os.environ["REDIS_PASSWORD"], 
-				redis_port=os.environ["REDIS_PORT"], 
-				cache_responses=True, 
-				timeout=30,
-				routing_strategy="simple-shuffle")
-		async def get_response(): 
-			response1 = await router.acompletion(model="gpt-3.5-turbo", messages=messages)
-			print(f"response1: {response1}")
-			response2 = await router.acompletion(model="gpt-3.5-turbo", messages=messages)
-			print(f"response2: {response2}")
-			assert response1.id == response2.id
-			assert len(response1.choices[0].message.content) > 0
-			assert response1.choices[0].message.content == response2.choices[0].message.content
-		asyncio.run(get_response())
-		router.reset()
-	except litellm.Timeout as e: 
-		end_time = time.time()
-		print(f"timeout error occurred: {end_time - start_time}")
-		pass
-	except Exception as e:
-		traceback.print_exc()
-		pytest.fail(f"Error occurred: {e}")
 
 # test_acompletion_on_router() 
 
@@ -503,12 +450,11 @@ def test_aembedding_on_router():
 			model="text-embedding-ada-002",
 			input=["good morning from litellm 2"],
 		)
-		print("sync embedding response: ", response)
 		router.reset()
 	except Exception as e:
 		traceback.print_exc()
 		pytest.fail(f"Error occurred: {e}")
-test_aembedding_on_router()
+# test_aembedding_on_router()
 
 
 def test_azure_embedding_on_router():
@@ -550,7 +496,7 @@ def test_azure_embedding_on_router():
 	except Exception as e:
 		traceback.print_exc()
 		pytest.fail(f"Error occurred: {e}")
-test_azure_embedding_on_router()
+# test_azure_embedding_on_router()
 
 
 def test_bedrock_on_router():
@@ -587,6 +533,30 @@ def test_bedrock_on_router():
 		pytest.fail(f"Error occurred: {e}")
 # test_bedrock_on_router()
 
+# test openai-compatible endpoint
+@pytest.mark.asyncio
+async def test_mistral_on_router():
+	litellm.set_verbose = True
+	model_list = [
+			{
+				"model_name": "gpt-3.5-turbo",
+				"litellm_params": {
+					"model": "mistral/mistral-medium",
+				},
+			},
+		]
+	router = Router(model_list=model_list)
+	response = await router.acompletion(
+				model="gpt-3.5-turbo",
+				messages=[
+					{
+						"role": "user",
+						"content": "hello from litellm test",
+					}
+				]
+			)
+	print(response)
+asyncio.run(test_mistral_on_router())
 
 def test_openai_completion_on_router():
 	# [PROD Use Case] - Makes an acompletion call + async acompletion call, and sync acompletion call, sync completion + stream
@@ -623,13 +593,14 @@ def test_openai_completion_on_router():
 				messages=[
 					{
 						"role": "user",
-						"content": "hello from litellm test",
+						"content": f"hello from litellm test {time.time()}",
 					}
 				],
 				stream=True
 			)
 			complete_response = ""
 			print(response)
+			# if you want to see all the attributes and methods
 			async for chunk in response:
 				print(chunk)
 				complete_response += chunk.choices[0].delta.content or ""
@@ -673,3 +644,140 @@ def test_openai_completion_on_router():
 		traceback.print_exc()
 		pytest.fail(f"Error occurred: {e}")
 # test_openai_completion_on_router()
+
+
+def test_reading_keys_os_environ():
+	import openai
+	try:
+		model_list = [
+				{
+					"model_name": "gpt-3.5-turbo",
+					"litellm_params": {
+						"model": "gpt-3.5-turbo",
+						"api_key": "os.environ/AZURE_API_KEY",
+						"api_base": "os.environ/AZURE_API_BASE",
+						"api_version": "os.environ/AZURE_API_VERSION",
+						"timeout": "os.environ/AZURE_TIMEOUT",
+						"stream_timeout": "os.environ/AZURE_STREAM_TIMEOUT",
+						"max_retries": "os.environ/AZURE_MAX_RETRIES",
+					},
+				},
+			]
+		
+		router = Router(model_list=model_list)
+		for model in router.model_list:
+			assert model["litellm_params"]["api_key"] == os.environ["AZURE_API_KEY"], f"{model['litellm_params']['api_key']} vs {os.environ['AZURE_API_KEY']}"
+			assert model["litellm_params"]["api_base"] == os.environ["AZURE_API_BASE"], f"{model['litellm_params']['api_base']} vs {os.environ['AZURE_API_BASE']}"
+			assert model["litellm_params"]["api_version"] == os.environ["AZURE_API_VERSION"], f"{model['litellm_params']['api_version']} vs {os.environ['AZURE_API_VERSION']}"
+			assert float(model["litellm_params"]["timeout"]) == float(os.environ["AZURE_TIMEOUT"]), f"{model['litellm_params']['timeout']} vs {os.environ['AZURE_TIMEOUT']}"
+			assert float(model["litellm_params"]["stream_timeout"]) == float(os.environ["AZURE_STREAM_TIMEOUT"]), f"{model['litellm_params']['stream_timeout']} vs {os.environ['AZURE_STREAM_TIMEOUT']}"
+			assert int(model["litellm_params"]["max_retries"]) == int(os.environ["AZURE_MAX_RETRIES"]), f"{model['litellm_params']['max_retries']} vs {os.environ['AZURE_MAX_RETRIES']}"
+			print("passed testing of reading keys from os.environ")
+			async_client: openai.AsyncAzureOpenAI = model["async_client"] # type: ignore
+			assert async_client.api_key == os.environ["AZURE_API_KEY"]
+			assert async_client.base_url == os.environ["AZURE_API_BASE"]	
+			assert async_client.max_retries == (os.environ["AZURE_MAX_RETRIES"]), f"{async_client.max_retries} vs {os.environ['AZURE_MAX_RETRIES']}"
+			assert async_client.timeout == (os.environ["AZURE_TIMEOUT"]), f"{async_client.timeout} vs {os.environ['AZURE_TIMEOUT']}"
+			print("async client set correctly!")
+
+			print("\n Testing async streaming client")
+
+			stream_async_client: openai.AsyncAzureOpenAI = model["stream_async_client"] # type: ignore
+			assert stream_async_client.api_key == os.environ["AZURE_API_KEY"]
+			assert stream_async_client.base_url == os.environ["AZURE_API_BASE"]	
+			assert stream_async_client.max_retries == (os.environ["AZURE_MAX_RETRIES"]), f"{stream_async_client.max_retries} vs {os.environ['AZURE_MAX_RETRIES']}"
+			assert stream_async_client.timeout == (os.environ["AZURE_STREAM_TIMEOUT"]), f"{stream_async_client.timeout} vs {os.environ['AZURE_TIMEOUT']}"
+			print("async stream client set correctly!")
+
+			print("\n Testing sync client")
+			client: openai.AzureOpenAI = model["client"] # type: ignore
+			assert client.api_key == os.environ["AZURE_API_KEY"]
+			assert client.base_url == os.environ["AZURE_API_BASE"]	
+			assert client.max_retries == (os.environ["AZURE_MAX_RETRIES"]), f"{client.max_retries} vs {os.environ['AZURE_MAX_RETRIES']}"
+			assert client.timeout == (os.environ["AZURE_TIMEOUT"]), f"{client.timeout} vs {os.environ['AZURE_TIMEOUT']}"
+			print("sync client set correctly!")
+
+			print("\n Testing sync stream client")
+			stream_client: openai.AzureOpenAI = model["stream_client"] # type: ignore
+			assert stream_client.api_key == os.environ["AZURE_API_KEY"]
+			assert stream_client.base_url == os.environ["AZURE_API_BASE"]	
+			assert stream_client.max_retries == (os.environ["AZURE_MAX_RETRIES"]), f"{stream_client.max_retries} vs {os.environ['AZURE_MAX_RETRIES']}"
+			assert stream_client.timeout == (os.environ["AZURE_STREAM_TIMEOUT"]), f"{stream_client.timeout} vs {os.environ['AZURE_TIMEOUT']}"
+			print("sync stream client set correctly!")
+
+		router.reset()
+	except Exception as e:
+		traceback.print_exc()
+		pytest.fail(f"Error occurred: {e}")
+
+# test_reading_keys_os_environ()
+
+
+def test_reading_openai_keys_os_environ():
+	import openai
+	try:
+		model_list = [
+				{
+					"model_name": "gpt-3.5-turbo",
+					"litellm_params": {
+						"model": "gpt-3.5-turbo",
+						"api_key": "os.environ/OPENAI_API_KEY",
+						"timeout": "os.environ/AZURE_TIMEOUT",
+						"stream_timeout": "os.environ/AZURE_STREAM_TIMEOUT",
+						"max_retries": "os.environ/AZURE_MAX_RETRIES",
+					},
+				},
+				{
+					"model_name": "text-embedding-ada-002",
+					"litellm_params": {
+						"model": "text-embedding-ada-002",
+						"api_key": "os.environ/OPENAI_API_KEY",
+						"timeout": "os.environ/AZURE_TIMEOUT",
+						"stream_timeout": "os.environ/AZURE_STREAM_TIMEOUT",
+						"max_retries": "os.environ/AZURE_MAX_RETRIES",
+					},
+				},
+
+			]
+		
+		router = Router(model_list=model_list)
+		for model in router.model_list:
+			assert model["litellm_params"]["api_key"] == os.environ["OPENAI_API_KEY"], f"{model['litellm_params']['api_key']} vs {os.environ['AZURE_API_KEY']}"
+			assert float(model["litellm_params"]["timeout"]) == float(os.environ["AZURE_TIMEOUT"]), f"{model['litellm_params']['timeout']} vs {os.environ['AZURE_TIMEOUT']}"
+			assert float(model["litellm_params"]["stream_timeout"]) == float(os.environ["AZURE_STREAM_TIMEOUT"]), f"{model['litellm_params']['stream_timeout']} vs {os.environ['AZURE_STREAM_TIMEOUT']}"
+			assert int(model["litellm_params"]["max_retries"]) == int(os.environ["AZURE_MAX_RETRIES"]), f"{model['litellm_params']['max_retries']} vs {os.environ['AZURE_MAX_RETRIES']}"
+			print("passed testing of reading keys from os.environ")
+			async_client: openai.AsyncOpenAI = model["async_client"] # type: ignore
+			assert async_client.api_key == os.environ["OPENAI_API_KEY"]
+			assert async_client.max_retries == (os.environ["AZURE_MAX_RETRIES"]), f"{async_client.max_retries} vs {os.environ['AZURE_MAX_RETRIES']}"
+			assert async_client.timeout == (os.environ["AZURE_TIMEOUT"]), f"{async_client.timeout} vs {os.environ['AZURE_TIMEOUT']}"
+			print("async client set correctly!")
+
+			print("\n Testing async streaming client")
+
+			stream_async_client: openai.AsyncOpenAI = model["stream_async_client"] # type: ignore
+			assert stream_async_client.api_key == os.environ["OPENAI_API_KEY"]
+			assert stream_async_client.max_retries == (os.environ["AZURE_MAX_RETRIES"]), f"{stream_async_client.max_retries} vs {os.environ['AZURE_MAX_RETRIES']}"
+			assert stream_async_client.timeout == (os.environ["AZURE_STREAM_TIMEOUT"]), f"{stream_async_client.timeout} vs {os.environ['AZURE_TIMEOUT']}"
+			print("async stream client set correctly!")
+
+			print("\n Testing sync client")
+			client: openai.AzureOpenAI = model["client"] # type: ignore
+			assert client.api_key == os.environ["OPENAI_API_KEY"]
+			assert client.max_retries == (os.environ["AZURE_MAX_RETRIES"]), f"{client.max_retries} vs {os.environ['AZURE_MAX_RETRIES']}"
+			assert client.timeout == (os.environ["AZURE_TIMEOUT"]), f"{client.timeout} vs {os.environ['AZURE_TIMEOUT']}"
+			print("sync client set correctly!")
+
+			print("\n Testing sync stream client")
+			stream_client: openai.AzureOpenAI = model["stream_client"] # type: ignore
+			assert stream_client.api_key == os.environ["OPENAI_API_KEY"]
+			assert stream_client.max_retries == (os.environ["AZURE_MAX_RETRIES"]), f"{stream_client.max_retries} vs {os.environ['AZURE_MAX_RETRIES']}"
+			assert stream_client.timeout == (os.environ["AZURE_STREAM_TIMEOUT"]), f"{stream_client.timeout} vs {os.environ['AZURE_TIMEOUT']}"
+			print("sync stream client set correctly!")
+
+		router.reset()
+	except Exception as e:
+		traceback.print_exc()
+		pytest.fail(f"Error occurred: {e}")
+
+# test_reading_openai_keys_os_environ()

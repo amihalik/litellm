@@ -58,7 +58,7 @@ curl --location 'http://0.0.0.0:8000/chat/completions' \
           "role": "user",
           "content": "what llm are you"
         }
-      ],
+      ]
     }
 '
 ```
@@ -115,6 +115,40 @@ print(response)
 ```
 
 </TabItem>
+<TabItem value="langchain-embedding" label="Langchain Embeddings">
+
+```python
+from langchain.embeddings import OpenAIEmbeddings
+
+embeddings = OpenAIEmbeddings(model="sagemaker-embeddings", openai_api_base="http://0.0.0.0:8000", openai_api_key="temp-key")
+
+
+text = "This is a test document."
+
+query_result = embeddings.embed_query(text)
+
+print(f"SAGEMAKER EMBEDDINGS")
+print(query_result[:5])
+
+embeddings = OpenAIEmbeddings(model="bedrock-embeddings", openai_api_base="http://0.0.0.0:8000", openai_api_key="temp-key")
+
+text = "This is a test document."
+
+query_result = embeddings.embed_query(text)
+
+print(f"BEDROCK EMBEDDINGS")
+print(query_result[:5])
+
+embeddings = OpenAIEmbeddings(model="bedrock-titan-embeddings", openai_api_base="http://0.0.0.0:8000", openai_api_key="temp-key")
+
+text = "This is a test document."
+
+query_result = embeddings.embed_query(text)
+
+print(f"TITAN EMBEDDINGS")
+print(query_result[:5])
+```
+</TabItem>
 </Tabs>
 
 
@@ -144,7 +178,7 @@ $ litellm --model azure/my-deployment-name
 ```
 
 </TabItem>
-<TabItem value="openai-proxy" label="OpenAI">
+<TabItem value="openai" label="OpenAI">
 
 ```shell
 $ export OPENAI_API_KEY=my-api-key
@@ -154,13 +188,23 @@ $ export OPENAI_API_KEY=my-api-key
 $ litellm --model gpt-3.5-turbo
 ```
 </TabItem>
+<TabItem value="openai-proxy" label="OpenAI Compatible Endpoint">
+
+```shell
+$ export OPENAI_API_KEY=my-api-key
+```
+
+```shell
+$ litellm --model openai/<your model name> --api_base <your-api-base> # e.g. http://0.0.0.0:3000
+```
+</TabItem>
 <TabItem value="huggingface" label="Huggingface (TGI) Deployed">
 
 ```shell
 $ export HUGGINGFACE_API_KEY=my-api-key #[OPTIONAL]
 ```
 ```shell
-$ litellm --model huggingface/<your model name> --api_base https://k58ory32yinf1ly0.us-east-1.aws.endpoints.huggingface.cloud
+$ litellm --model huggingface/<your model name> --api_base <your-api-base> # e.g. http://0.0.0.0:3000
 ```
 
 </TabItem>
@@ -270,6 +314,8 @@ $ litellm --model command-nightly
 </Tabs>
 
 
+
+
 ## Quick Start - LiteLLM Proxy + Config.yaml
 The config allows you to create a model list and set `api_base`, `max_tokens` (all litellm params). See more details about the config [here](https://docs.litellm.ai/docs/proxy/configs)
 
@@ -277,9 +323,9 @@ The config allows you to create a model list and set `api_base`, `max_tokens` (a
 Example config
 
 ```yaml
-model_list:
-  - model_name: gpt-3.5-turbo
-    litellm_params:
+model_list: 
+  - model_name: gpt-3.5-turbo # user-facing model alias
+    litellm_params: # all params accepted by litellm.completion() - https://docs.litellm.ai/docs/completion/input
       model: azure/<your-deployment-name>
       api_base: <your-azure-api-endpoint>
       api_key: <your-azure-api-key>
@@ -288,6 +334,10 @@ model_list:
       model: azure/gpt-turbo-small-ca
       api_base: https://my-endpoint-canada-berri992.openai.azure.com/
       api_key: <your-azure-api-key>
+  - model_name: vllm-model
+    litellm_params:
+      model: openai/<your-model-name>
+      api_base: <your-api-base> # e.g. http://0.0.0.0:3000
 ```
 
 ### Run proxy with config
@@ -296,6 +346,23 @@ model_list:
 litellm --config your_config.yaml
 ```
 
+[**More Info**](./configs.md)
+
+## Server Endpoints
+- POST `/chat/completions` - chat completions endpoint to call 100+ LLMs
+- POST `/completions` - completions endpoint
+- POST `/embeddings` - embedding endpoint for Azure, OpenAI, Huggingface endpoints
+- GET `/models` - available models on server
+- POST `/key/generate` - generate a key to access the proxy
+
+## Gunicorn + Proxy 
+
+Command: 
+```python
+cmd = f"gunicorn litellm.proxy.proxy_server:app --workers {num_workers} --worker-class uvicorn.workers.UvicornWorker --bind {host}:{port}"
+```
+
+[**Code**](https://github.com/BerriAI/litellm/blob/077f6b1298101079b72396bdf04f8ca0cf737720/litellm/tests/test_proxy_gunicorn.py#L4)
 ## Quick Start Docker Image: Github Container Registry
 
 ### Pull the litellm ghcr docker image
@@ -324,13 +391,46 @@ Here's how you can run the docker image and start litellm on port 8002 with `num
 ```shell
 docker run ghcr.io/berriai/litellm:main-v1.10.0 --port 8002 --num_workers 8
 ```
+  
+#### Run the Docker Image using docker compose
 
-## Server Endpoints
-- POST `/chat/completions` - chat completions endpoint to call 100+ LLMs
-- POST `/completions` - completions endpoint
-- POST `/embeddings` - embedding endpoint for Azure, OpenAI, Huggingface endpoints
-- GET `/models` - available models on server
-- POST `/key/generate` - generate a key to access the proxy
+**Step 1**
+
+- (Recommended) Use the example file `docker-compose.example.yml` given in the project root. e.g. https://github.com/BerriAI/litellm/blob/main/docker-compose.example.yml
+
+- Rename the file `docker-compose.example.yml` to `docker-compose.yml`.
+
+Here's an example `docker-compose.yml` file
+```yaml
+version: "3.9"
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:main
+    ports:
+      - "8000:8000" # Map the container port to the host, change the host port if necessary
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml # Mount the local configuration file
+    # You can change the port or number of workers as per your requirements or pass any new supported CLI augument. Make sure the port passed here matches with the container port defined above in `ports` value
+    command: [ "--config", "/app/config.yaml", "--port", "8000", "--num_workers", "8" ]
+
+# ...rest of your docker-compose config if any
+```
+
+**Step 2**
+
+Create a `litellm-config.yaml` file with your LiteLLM config relative to your `docker-compose.yml` file.
+
+Check the config doc [here](https://docs.litellm.ai/docs/proxy/configs)
+
+**Step 3**
+
+Run the command `docker-compose up` or `docker compose up` as per your docker installation.
+
+> Use `-d` flag to run the container in detached mode (background) e.g. `docker compose up -d`
+
+
+Your LiteLLM container should be running now on the defined port e.g. `8000`.
+
 
 ## Using with OpenAI compatible projects
 Set `base_url` to the LiteLLM Proxy server

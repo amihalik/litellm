@@ -10,30 +10,44 @@ import os, io
 sys.path.insert(
     0, os.path.abspath("../..")
 )  # Adds the parent directory to the system path 
-import pytest
+import pytest, logging
 import litellm
 from litellm import embedding, completion, completion_cost, Timeout
 from litellm import RateLimitError
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,  # Set the desired logging level
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 
 # test /chat/completion request to the proxy
 from fastapi.testclient import TestClient
 from fastapi import FastAPI
 from litellm.proxy.proxy_server import router, save_worker_config, initialize  # Replace with the actual module where your FastAPI router is defined
-save_worker_config(config=None, model=None, alias=None, api_base=None, api_version=None, debug=False, temperature=None, max_tokens=None, request_timeout=600, max_budget=None, telemetry=False, drop_params=True, add_function_to_prompt=False, headers=None, save=False, use_queue=False)
-app = FastAPI()
-app.include_router(router)  # Include your router in the test app
-@app.on_event("startup")
-async def wrapper_startup_event(): # required to reset config on app init - b/c pytest collects across multiple files - which sets the fastapi client + WORKER CONFIG to whatever was collected last
-    initialize(config=None, model=None, alias=None, api_base=None, api_version=None, debug=False, temperature=None, max_tokens=None, request_timeout=600, max_budget=None, telemetry=False, drop_params=True, add_function_to_prompt=False, headers=None, save=False, use_queue=False)
 
-# Here you create a fixture that will be used by your tests
-# Make sure the fixture returns TestClient(app)
-@pytest.fixture(autouse=True)
-def client():
-    with TestClient(app) as client:
-        yield client
+# Your bearer token
+token = ""
 
-def test_chat_completion(client):
+headers = {
+    "Authorization": f"Bearer {token}"
+}
+    
+@pytest.fixture(scope="function")
+def client_no_auth():
+    # Assuming litellm.proxy.proxy_server is an object
+    from litellm.proxy.proxy_server import cleanup_router_config_variables
+    cleanup_router_config_variables()
+    filepath = os.path.dirname(os.path.abspath(__file__))
+    config_fp = f"{filepath}/test_configs/test_config_no_auth.yaml"
+    # initialize can get run in parallel, it sets specific variables for the fast api app, sinc eit gets run in parallel different tests use the wrong variables
+    initialize(config=config_fp)
+    app = FastAPI()
+    app.include_router(router)  # Include your router in the test app
+
+    return TestClient(app)
+
+def test_chat_completion(client_no_auth):
+    global headers
     try:
         # Your test data
         test_data = {
@@ -46,8 +60,9 @@ def test_chat_completion(client):
             ],
             "max_tokens": 10,
         }
-        print("testing proxy server")
-        response = client.post("/v1/chat/completions", json=test_data)
+        
+        print("testing proxy server with chat completions")
+        response = client_no_auth.post("/v1/chat/completions", json=test_data)
         print(f"response - {response.text}")
         assert response.status_code == 200
         result = response.json()
@@ -57,7 +72,9 @@ def test_chat_completion(client):
 
 # Run the test
 
-def test_chat_completion_azure(client):
+def test_chat_completion_azure(client_no_auth):
+
+    global headers
     try:
         # Your test data
         test_data = {
@@ -70,8 +87,9 @@ def test_chat_completion_azure(client):
             ],
             "max_tokens": 10,
         }
-        print("testing proxy server with Azure Request")
-        response = client.post("/v1/chat/completions", json=test_data)
+        
+        print("testing proxy server with Azure Request /chat/completions")
+        response = client_no_auth.post("/v1/chat/completions", json=test_data)
 
         assert response.status_code == 200
         result = response.json()
@@ -84,14 +102,55 @@ def test_chat_completion_azure(client):
 # test_chat_completion_azure()
 
 
-def test_embedding(client):
+def test_embedding(client_no_auth):
+    global headers
+    from litellm.proxy.proxy_server import user_custom_auth 
+
     try:
         test_data = {
             "model": "azure/azure-embedding-model",
             "input": ["good morning from litellm"],
         }
-        print("testing proxy server with OpenAI embedding")
-        response = client.post("/v1/embeddings", json=test_data)
+
+        response = client_no_auth.post("/v1/embeddings", json=test_data)
+
+        assert response.status_code == 200
+        result = response.json()
+        print(len(result["data"][0]["embedding"]))
+        assert len(result["data"][0]["embedding"]) > 10 # this usually has len==1536 so
+    except Exception as e:
+        pytest.fail(f"LiteLLM Proxy test failed. Exception - {str(e)}")
+
+def test_bedrock_embedding(client_no_auth):
+    global headers
+    from litellm.proxy.proxy_server import user_custom_auth 
+
+    try:
+        test_data = {
+            "model": "amazon-embeddings",
+            "input": ["good morning from litellm"],
+        }
+
+        response = client_no_auth.post("/v1/embeddings", json=test_data)
+
+        assert response.status_code == 200
+        result = response.json()
+        print(len(result["data"][0]["embedding"]))
+        assert len(result["data"][0]["embedding"]) > 10 # this usually has len==1536 so
+    except Exception as e:
+        pytest.fail(f"LiteLLM Proxy test failed. Exception - {str(e)}")
+
+def test_sagemaker_embedding(client_no_auth):
+    global headers
+    from litellm.proxy.proxy_server import user_custom_auth 
+
+    try:
+        test_data = {
+            "model": "GPT-J 6B - Sagemaker Text Embedding (Internal)",
+            "input": ["good morning from litellm"],
+        }
+
+        response = client_no_auth.post("/v1/embeddings", json=test_data)
 
         assert response.status_code == 200
         result = response.json()
@@ -103,8 +162,9 @@ def test_embedding(client):
 # Run the test
 # test_embedding()
 
-
-def test_add_new_model(client): 
+# @pytest.mark.skip(reason="hitting yaml load issues on circle-ci")
+def test_add_new_model(client_no_auth):
+    global headers
     try: 
         test_data = {
             "model_name": "test_openai_models",
@@ -115,15 +175,15 @@ def test_add_new_model(client):
                 "description": "this is a test openai model"
             }
         }
-        client.post("/model/new", json=test_data)
-        response = client.get("/model/info")
+        client_no_auth.post("/model/new", json=test_data, headers=headers)
+        response = client_no_auth.get("/model/info", headers=headers)
         assert response.status_code == 200
         result = response.json() 
         print(f"response: {result}")
         model_info = None
         for m in result["data"]:
-            if m["id"]["model_name"] == "test_openai_models":
-                model_info = m["id"]["model_info"]
+            if m["model_name"] == "test_openai_models":
+                model_info = m["model_info"]
         assert model_info["description"] == "this is a test openai model"
     except Exception as e: 
         pytest.fail(f"LiteLLM Proxy test failed. Exception {str(e)}")
@@ -144,10 +204,9 @@ class MyCustomHandler(CustomLogger):
 customHandler = MyCustomHandler()
 
 
-def test_chat_completion_optional_params(client):
+def test_chat_completion_optional_params(client_no_auth):
     # [PROXY: PROD TEST] - DO NOT DELETE
     # This tests if all the /chat/completion params are passed to litellm
-
     try:
         # Your test data
         litellm.set_verbose=True
@@ -165,7 +224,7 @@ def test_chat_completion_optional_params(client):
         
         litellm.callbacks = [customHandler]
         print("testing proxy server: optional params")
-        response = client.post("/v1/chat/completions", json=test_data)
+        response = client_no_auth.post("/v1/chat/completions", json=test_data)
         assert response.status_code == 200
         result = response.json()
         print(f"Received response: {result}")
@@ -196,6 +255,29 @@ def test_load_router_config():
         result = load_router_config(router=None, config_file_path=f"{filepath}/example_config_yaml/azure_config.yaml")
         print(result)
         assert len(result[1]) == 2
+
+        # tests for litellm.cache set from config
+        print("testing reading proxy config for cache")
+        litellm.cache = None
+        load_router_config(
+            router=None,
+            config_file_path=f"{filepath}/example_config_yaml/cache_no_params.yaml"
+        )
+        assert litellm.cache is not None
+        assert "redis_client" in vars(litellm.cache.cache) # it should default to redis on proxy
+        assert litellm.cache.supported_call_types == ['completion', 'acompletion', 'embedding', 'aembedding'] # init with all call types
+       
+        print("testing reading proxy config for cache with params")
+        load_router_config(
+            router=None,
+            config_file_path=f"{filepath}/example_config_yaml/cache_with_params.yaml"
+        )
+        assert litellm.cache is not None
+        print(litellm.cache)
+        print(litellm.cache.supported_call_types)
+        print(vars(litellm.cache.cache))
+        assert "redis_client" in vars(litellm.cache.cache) # it should default to redis on proxy
+        assert litellm.cache.supported_call_types == ['embedding', 'aembedding'] # init with all call types
 
     except Exception as e:
         pytest.fail("Proxy: Got exception reading config", e)

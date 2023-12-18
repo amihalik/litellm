@@ -37,7 +37,7 @@ class LangFuseLogger:
                 f"Langfuse Logging - Enters logging function for model {kwargs}"
             )
             litellm_params = kwargs.get("litellm_params", {})
-            metadata = litellm_params.get("metadata", {})
+            metadata = litellm_params.get("metadata", {}) or {} # if litellm_params['metadata'] == None 
             prompt = [kwargs.get('messages')]
             optional_params = kwargs.get("optional_params", {})
 
@@ -58,7 +58,7 @@ class LangFuseLogger:
                 model=kwargs['model'],
                 modelParameters=optional_params,
                 prompt=prompt,
-                completion=response_obj['choices'][0]['message'],
+                completion=response_obj['choices'][0]['message'].json(),
                 usage=Usage(
                     prompt_tokens=response_obj['usage']['prompt_tokens'],
                     completion_tokens=response_obj['usage']['completion_tokens']
@@ -70,6 +70,9 @@ class LangFuseLogger:
                 f"Langfuse Layer Logging - final response object: {response_obj}"
             )
         except:
-            # traceback.print_exc()
+            traceback.print_exc()
             print_verbose(f"Langfuse Layer Error - {traceback.format_exc()}")
             pass
+
+    async def _async_log_event(self, kwargs, response_obj, start_time, end_time, print_verbose):
+        self.log_event(kwargs, response_obj, start_time, end_time, print_verbose)
